@@ -128,11 +128,132 @@ install_bird2() {
     fi
 }
 
+# 检测已有的WireGuard密钥
+detect_existing_keys() {
+    local key_dir="/etc/wireguard"
+    local found_keys=()
+
+    if [ -d "$key_dir" ]; then
+        # 查找所有私钥文件
+        while IFS= read -r -d '' keyfile; do
+            if [ -f "$keyfile" ]; then
+                local private_key=$(cat "$keyfile" 2>/dev/null)
+                # 验证是否是有效的WireGuard私钥（44个字符的base64）
+                if [[ ${#private_key} -eq 44 ]] && [[ "$private_key" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+                    local public_key=$(echo "$private_key" | wg pubkey 2>/dev/null)
+                    if [ -n "$public_key" ]; then
+                        found_keys+=("$keyfile|$private_key|$public_key")
+                    fi
+                fi
+            fi
+        done < <(find "$key_dir" -type f \( -name "*.key" -o -name "privatekey" -o -name "private.key" \) -print0 2>/dev/null)
+
+        # 也检查现有配置文件中的私钥
+        while IFS= read -r -d '' conffile; do
+            if [ -f "$conffile" ]; then
+                local private_key=$(grep "^PrivateKey" "$conffile" | awk '{print $3}' | tr -d ' ')
+                if [ -n "$private_key" ] && [[ ${#private_key} -eq 44 ]]; then
+                    local public_key=$(echo "$private_key" | wg pubkey 2>/dev/null)
+                    if [ -n "$public_key" ]; then
+                        found_keys+=("$conffile|$private_key|$public_key")
+                    fi
+                fi
+            fi
+        done < <(find "$key_dir" -type f -name "*.conf" -print0 2>/dev/null)
+    fi
+
+    # 返回找到的密钥数量
+    echo "${#found_keys[@]}"
+    # 将密钥信息保存到临时文件
+    if [ ${#found_keys[@]} -gt 0 ]; then
+        printf '%s\n' "${found_keys[@]}" > /tmp/wg_detected_keys.tmp
+    fi
+}
+
+# 显示已有密钥供用户选择
+show_existing_keys() {
+    if [ ! -f /tmp/wg_detected_keys.tmp ]; then
+        return 1
+    fi
+
+    echo ""
+    print_info "检测到以下WireGuard密钥:"
+    echo ""
+
+    local index=1
+    while IFS='|' read -r source private_key public_key; do
+        echo "[$index] 来源: $source"
+        echo "    公钥: $public_key"
+        echo ""
+        ((index++))
+    done < /tmp/wg_detected_keys.tmp
+
+    return 0
+}
+
+# 选择已有密钥
+select_existing_key() {
+    local selection=$1
+    local index=1
+
+    while IFS='|' read -r source private_key public_key; do
+        if [ "$index" -eq "$selection" ]; then
+            echo "$private_key|$public_key"
+            return 0
+        fi
+        ((index++))
+    done < /tmp/wg_detected_keys.tmp
+
+    return 1
+}
+
 # 生成密钥对
 generate_keys() {
     local private_key=$(wg genkey)
     local public_key=$(echo "$private_key" | wg pubkey)
     echo "$private_key|$public_key"
+}
+
+# 获取或生成密钥
+get_or_generate_keys() {
+    local key_count=$(detect_existing_keys)
+
+    if [ "$key_count" -gt 0 ]; then
+        print_info "检测到 $key_count 个已有的WireGuard密钥"
+        echo ""
+        read -p "是否使用已有密钥? [Y/n]: " use_existing
+        use_existing=${use_existing:-Y}
+
+        if [[ "$use_existing" =~ ^[Yy]$ ]]; then
+            show_existing_keys
+
+            while true; do
+                read -p "请选择密钥编号 (1-$key_count) 或输入 0 生成新密钥: " key_selection
+
+                if [ "$key_selection" -eq 0 ]; then
+                    print_info "生成新密钥..."
+                    generate_keys
+                    rm -f /tmp/wg_detected_keys.tmp
+                    return 0
+                elif [ "$key_selection" -ge 1 ] && [ "$key_selection" -le "$key_count" ]; then
+                    local keys=$(select_existing_key "$key_selection")
+                    if [ -n "$keys" ]; then
+                        print_info "使用已选择的密钥"
+                        echo "$keys"
+                        rm -f /tmp/wg_detected_keys.tmp
+                        return 0
+                    fi
+                fi
+
+                print_error "无效的选择，请重试"
+            done
+        fi
+    fi
+
+    # 生成新密钥
+    print_info "生成新密钥..."
+    generate_keys
+    rm -f /tmp/wg_detected_keys.tmp
 }
 
 # 生成IPv6 Link-Local地址
@@ -372,9 +493,9 @@ interactive_setup() {
         fi
     fi
 
-    # 生成密钥
-    print_info "生成密钥对..."
-    keys=$(generate_keys)
+    # 获取或生成密钥
+    echo ""
+    keys=$(get_or_generate_keys)
     PRIVATE_KEY=$(echo "$keys" | cut -d'|' -f1)
     PUBLIC_KEY=$(echo "$keys" | cut -d'|' -f2)
 

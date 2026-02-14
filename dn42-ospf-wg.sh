@@ -176,15 +176,15 @@ show_existing_keys() {
         return 1
     fi
 
-    echo ""
-    print_info "检测到以下WireGuard密钥:"
-    echo ""
+    echo "" >&2
+    print_info "检测到以下WireGuard密钥:" >&2
+    echo "" >&2
 
     local index=1
     while IFS='|' read -r source private_key public_key; do
-        echo "[$index] 来源: $source"
-        echo "    公钥: $public_key"
-        echo ""
+        echo "[$index] 来源: $source" >&2
+        echo "    公钥: $public_key" >&2
+        echo "" >&2
         ((index++))
     done < /tmp/wg_detected_keys.tmp
 
@@ -219,39 +219,39 @@ get_or_generate_keys() {
     local key_count=$(detect_existing_keys)
 
     if [ "$key_count" -gt 0 ]; then
-        print_info "检测到 $key_count 个已有的WireGuard密钥"
-        echo ""
-        read -p "是否使用已有密钥? [Y/n]: " use_existing
+        print_info "检测到 $key_count 个已有的WireGuard密钥" >&2
+        echo "" >&2
+        read -p "是否使用已有密钥? [Y/n]: " use_existing >&2
         use_existing=${use_existing:-Y}
 
         if [[ "$use_existing" =~ ^[Yy]$ ]]; then
             show_existing_keys
 
             while true; do
-                read -p "请选择密钥编号 (1-$key_count) 或输入 0 生成新密钥: " key_selection
+                read -p "请选择密钥编号 (1-$key_count) 或输入 0 生成新密钥: " key_selection >&2
 
-                if [ "$key_selection" -eq 0 ]; then
-                    print_info "生成新密钥..."
+                if [ "$key_selection" -eq 0 ] 2>/dev/null; then
+                    print_info "生成新密钥..." >&2
                     generate_keys
                     rm -f /tmp/wg_detected_keys.tmp
                     return 0
-                elif [ "$key_selection" -ge 1 ] && [ "$key_selection" -le "$key_count" ]; then
+                elif [ "$key_selection" -ge 1 ] 2>/dev/null && [ "$key_selection" -le "$key_count" ] 2>/dev/null; then
                     local keys=$(select_existing_key "$key_selection")
                     if [ -n "$keys" ]; then
-                        print_info "使用已选择的密钥"
+                        print_info "使用已选择的密钥" >&2
                         echo "$keys"
                         rm -f /tmp/wg_detected_keys.tmp
                         return 0
                     fi
                 fi
 
-                print_error "无效的选择，请重试"
+                print_error "无效的选择，请重试" >&2
             done
         fi
     fi
 
     # 生成新密钥
-    print_info "生成新密钥..."
+    print_info "生成新密钥..." >&2
     generate_keys
     rm -f /tmp/wg_detected_keys.tmp
 }

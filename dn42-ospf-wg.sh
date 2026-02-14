@@ -35,6 +35,85 @@ print_note() {
     echo -e "${BLUE}[NOTE]${NC} $1"
 }
 
+# 输入验证函数
+validate_input() {
+    local input="$1"
+    local type="$2"
+
+    case "$type" in
+        "node_name")
+            [[ -n "$input" ]] && [[ "$input" =~ ^[a-zA-Z0-9_-]+$ ]]
+            ;;
+        "port")
+            [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le 65535 ]
+            ;;
+        "mtu")
+            [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1280 ] && [ "$input" -le 1500 ]
+            ;;
+        "wg_pubkey")
+            [[ ${#input} -eq 44 ]] && [[ "$input" =~ ^[A-Za-z0-9+/]{43}=$ ]]
+            ;;
+        "endpoint")
+            [[ -z "$input" ]] || [[ "$input" =~ ^[a-zA-Z0-9.-]+:[0-9]+$ ]]
+            ;;
+        "asn")
+            [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le 4294967295 ]
+            ;;
+        "ipv4")
+            [[ "$input" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]
+            ;;
+        "link_local")
+            [[ "$input" =~ ^fe80::[0-9a-fA-F:]+$ ]]
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# 带重试的输入函数
+read_with_retry() {
+    local prompt="$1"
+    local type="$2"
+    local default="$3"
+    local max_attempts=3
+    local attempt=1
+    local input
+
+    while [ $attempt -le $max_attempts ]; do
+        if [ -n "$default" ]; then
+            read -p "${prompt} [默认: ${default}]: " input
+            input=${input:-$default}
+        else
+            read -p "${prompt}: " input
+        fi
+
+        # 如果有默认值且用户直接回车，使用默认值
+        if [ -z "$input" ] && [ -n "$default" ]; then
+            echo "$default"
+            return 0
+        fi
+
+        # 验证输入
+        if validate_input "$input" "$type"; then
+            echo "$input"
+            return 0
+        else
+            print_error "输入格式不正确"
+            if [ $attempt -lt $max_attempts ]; then
+                print_warning "请重新输入 (剩余 $((max_attempts - attempt)) 次机会)"
+            else
+                print_error "输入失败次数过多"
+                return 1
+            fi
+        fi
+
+        ((attempt++))
+    done
+
+    return 1
+}
+
 # 检查是否为root用户
 check_root() {
     if [ "$EUID" -ne 0 ]; then
@@ -132,34 +211,39 @@ install_bird2() {
 detect_existing_keys() {
     local key_dir="/etc/wireguard"
     local found_keys=()
+    declare -A seen_public_keys  # 用于去重
 
     if [ -d "$key_dir" ]; then
-        # 查找所有私钥文件
+        # 优先查找独立的私钥文件
         while IFS= read -r -d '' keyfile; do
             if [ -f "$keyfile" ]; then
-                local private_key=$(cat "$keyfile" 2>/dev/null)
+                local private_key=$(cat "$keyfile" 2>/dev/null | tr -d '[:space:]')
                 # 验证是否是有效的WireGuard私钥（44个字符的base64）
                 if [[ ${#private_key} -eq 44 ]] && [[ "$private_key" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
                     local public_key=$(echo "$private_key" | wg pubkey 2>/dev/null)
-                    if [ -n "$public_key" ]; then
+                    if [ -n "$public_key" ] && [ -z "${seen_public_keys[$public_key]}" ]; then
                         found_keys+=("$keyfile|$private_key|$public_key")
+                        seen_public_keys[$public_key]=1
                     fi
                 fi
             fi
-        done < <(find "$key_dir" -type f \( -name "*.key" -o -name "privatekey" -o -name "private.key" \) -print0 2>/dev/null)
+        done < <(find "$key_dir" -maxdepth 1 -type f \( -name "*.key" -o -name "privatekey" -o -name "private.key" \) -print0 2>/dev/null)
 
-        # 也检查现有配置文件中的私钥
-        while IFS= read -r -d '' conffile; do
-            if [ -f "$conffile" ]; then
-                local private_key=$(grep "^PrivateKey" "$conffile" | awk '{print $3}' | tr -d ' ')
-                if [ -n "$private_key" ] && [[ ${#private_key} -eq 44 ]]; then
-                    local public_key=$(echo "$private_key" | wg pubkey 2>/dev/null)
-                    if [ -n "$public_key" ]; then
-                        found_keys+=("$conffile|$private_key|$public_key")
+        # 如果没有找到独立密钥文件，再从配置文件中提取（仅提取一次）
+        if [ ${#found_keys[@]} -eq 0 ]; then
+            while IFS= read -r -d '' conffile; do
+                if [ -f "$conffile" ]; then
+                    local private_key=$(grep "^PrivateKey" "$conffile" | head -1 | awk '{print $3}' | tr -d '[:space:]')
+                    if [ -n "$private_key" ] && [[ ${#private_key} -eq 44 ]]; then
+                        local public_key=$(echo "$private_key" | wg pubkey 2>/dev/null)
+                        if [ -n "$public_key" ] && [ -z "${seen_public_keys[$public_key]}" ]; then
+                            found_keys+=("$conffile|$private_key|$public_key")
+                            seen_public_keys[$public_key]=1
+                        fi
                     fi
                 fi
-            fi
-        done < <(find "$key_dir" -type f -name "*.conf" -print0 2>/dev/null)
+            done < <(find "$key_dir" -maxdepth 1 -type f -name "*.conf" -print0 2>/dev/null)
+        fi
     fi
 
     # 返回找到的密钥数量
@@ -343,8 +427,13 @@ start_interface() {
 
         # 启用开机自启
         if command -v systemctl &> /dev/null; then
-            systemctl enable wg-quick@${interface_name} 2>/dev/null || true
-            print_info "已设置开机自启"
+            if systemctl enable wg-quick@${interface_name} 2>/dev/null; then
+                print_info "已启用开机自启: wg-quick@${interface_name}"
+            else
+                print_warning "无法启用开机自启，请手动执行: systemctl enable wg-quick@${interface_name}"
+            fi
+        else
+            print_warning "未检测到systemd，无法设置开机自启"
         fi
     else
         print_error "启动接口失败"
@@ -368,6 +457,7 @@ generate_ospf_example() {
     local interface_name=$1
     local asn=$2
     local router_id=$3
+    local peer_link_local=$4
 
     echo ""
     print_info "=== BIRD OSPF配置示例 ==="
@@ -412,20 +502,10 @@ protocol ospf v3 ospf_dn42_v6 {
     };
 }
 
-# 如果需要BGP，可以重分发OSPF路由
-protocol bgp ibgp_peer {
-    local as ${asn};
-    neighbor <对端IP> as ${asn};
-
-    ipv4 {
-        import all;
-        export where source = RTS_OSPF;
-    };
-
-    ipv6 {
-        import all;
-        export where source = RTS_OSPF;
-    };
+# 使用链路本地地址进行 BGP Peer 的配置示例
+protocol bgp <名字> from dnpeers {
+    neighbor ${peer_link_local} % '${interface_name}' as ${asn};
+    source address <本地的链路本地地址>;
 }
 
 EOF
@@ -459,9 +539,9 @@ interactive_setup() {
 
     # 获取节点信息
     echo ""
-    read -p "节点名称 (例如: node1, hk, us): " NODE_NAME
+    NODE_NAME=$(read_with_retry "节点名称 (例如: node1, hk, us)" "node_name")
     if [ -z "$NODE_NAME" ]; then
-        print_error "节点名称不能为空"
+        print_error "节点名称输入失败"
         exit 1
     fi
 
@@ -474,12 +554,18 @@ interactive_setup() {
     print_info "生成的Link-Local地址: ${LINK_LOCAL}"
 
     # 监听端口
-    read -p "WireGuard监听端口 [默认: 51820]: " LISTEN_PORT
-    LISTEN_PORT=${LISTEN_PORT:-51820}
+    LISTEN_PORT=$(read_with_retry "WireGuard监听端口" "port" "51820")
+    if [ -z "$LISTEN_PORT" ]; then
+        print_error "端口输入失败"
+        exit 1
+    fi
 
     # MTU设置
-    read -p "MTU大小 [默认: ${DEFAULT_MTU}]: " MTU
-    MTU=${MTU:-${DEFAULT_MTU}}
+    MTU=$(read_with_retry "MTU大小" "mtu" "${DEFAULT_MTU}")
+    if [ -z "$MTU" ]; then
+        print_error "MTU输入失败"
+        exit 1
+    fi
 
     # 是否需要IPv4地址
     USE_IPV4_ADDR="no"
@@ -515,13 +601,20 @@ interactive_setup() {
     echo ""
     print_note "现在配置对端节点信息"
 
-    read -p "对端节点公钥: " PEER_PUBLIC_KEY
+    PEER_PUBLIC_KEY=$(read_with_retry "对端节点公钥" "wg_pubkey")
     if [ -z "$PEER_PUBLIC_KEY" ]; then
-        print_error "对端公钥不能为空"
+        print_error "对端公钥输入失败"
         exit 1
     fi
 
-    read -p "对端节点地址 (例如: peer.example.com:51820，留空表示被动连接): " PEER_ENDPOINT
+    PEER_ENDPOINT=$(read_with_retry "对端节点地址 (例如: peer.example.com:51820，留空表示被动连接)" "endpoint" "")
+
+    # 对端Link-Local地址
+    PEER_LINK_LOCAL=$(read_with_retry "对端Link-Local地址 (例如: fe80::1234:5678:90ab:cdef)" "link_local")
+    if [ -z "$PEER_LINK_LOCAL" ]; then
+        print_warning "未输入对端Link-Local地址，BGP配置示例将使用占位符"
+        PEER_LINK_LOCAL="<对端链路本地地址>"
+    fi
 
     # 配置节点
     configure_dn42_ospf_node "$INTERFACE_NAME" "$LINK_LOCAL" "$LISTEN_PORT" \
@@ -544,23 +637,24 @@ interactive_setup() {
     show_ospf=${show_ospf:-Y}
 
     if [[ "$show_ospf" =~ ^[Yy]$ ]]; then
-        read -p "你的DN42 ASN (例如: 4242421234): " ASN
-        read -p "你的Router ID (例如: 172.20.1.1): " ROUTER_ID
+        ASN=$(read_with_retry "你的DN42 ASN (例如: 4242421234)" "asn")
+        ROUTER_ID=$(read_with_retry "你的Router ID (例如: 172.20.1.1)" "ipv4")
         if [ -n "$ASN" ] && [ -n "$ROUTER_ID" ]; then
-            generate_ospf_example "$INTERFACE_NAME" "$ASN" "$ROUTER_ID"
+            generate_ospf_example "$INTERFACE_NAME" "$ASN" "$ROUTER_ID" "$PEER_LINK_LOCAL"
         fi
     fi
 
     echo ""
     print_info "配置完成！"
-    echo ""
-    print_note "下一步操作:"
-    echo "1. 在对端节点运行相同的脚本进行配置"
-    echo "2. 配置BIRD进行OSPF路由"
-    echo "3. 使用 'birdc show protocols' 检查OSPF状态"
-    echo "4. 使用 'birdc show ospf neighbors' 查看OSPF邻居"
-    echo "5. 使用 'birdc show route' 查看路由表"
 }
+
+# 清除临时文件
+cleanup() {
+    rm -f /tmp/wg_detected_keys.tmp
+}
+
+# 设置退出时清理
+trap cleanup EXIT
 
 # 主函数
 main() {
